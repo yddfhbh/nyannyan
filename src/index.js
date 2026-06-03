@@ -179,6 +179,7 @@ async function handleUploadCommand(interaction) {
     problemNumber,
     unit,
     answer: null,
+    answerInHeader: false,
     uploaderId: interaction.user.id,
   };
   const postedMessage = await targetChannel.send({
@@ -491,6 +492,7 @@ function parseProblemFromMessage(message) {
     problemNumber: header.problemNumber,
     unit: header.unit,
     answer,
+    answerInHeader: Boolean(header.answer),
     uploaderId: uploaderMatch?.groups?.uploaderId || message.author.id,
   };
 }
@@ -506,7 +508,8 @@ function parsePublishedProblem(content) {
     year: titleMatch.year,
     problemNumber: titleMatch.problemNumber,
     unit: titleMatch.unit,
-    answer: answerMatch?.groups?.answer ? Number(answerMatch.groups.answer) : null,
+    answer: answerMatch?.groups?.answer ? Number(answerMatch.groups.answer) : titleMatch.answer,
+    answerInHeader: Boolean(titleMatch.answer),
     uploaderId: uploaderMatch.groups.uploaderId,
   };
 }
@@ -528,12 +531,17 @@ function parseProblemHeader(content) {
 
 function renderProblemContent(problem) {
   const answerText = problem.answer ? `${problem.answer}번` : '미선택';
+  const answerSuffix = problem.answerInHeader && problem.answer ? `, ${problem.answer}번` : '';
+  const title = `${problem.year}/일반, ${problem.problemNumber}번 -${problem.unit}${answerSuffix}`;
+  const lines = [title];
 
-  return [
-    `${problem.year}/일반, ${problem.problemNumber}번 -${problem.unit}`,
-    `정답: ${answerText}`,
-    `업로더: <@${problem.uploaderId}>`,
-  ].join('\n');
+  if (!answerSuffix) {
+    lines.push(`정답: ${answerText}`);
+  }
+
+  lines.push(`업로더: <@${problem.uploaderId}>`);
+
+  return lines.join('\n');
 }
 
 function formatMoveResult(result, fromUnit, toUnit, targetChannel, previewOnly) {
