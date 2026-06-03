@@ -1,0 +1,7 @@
+node_modules/
+.env
+npm-debug.log*
+
+# Local scratch notes
+긴거.md
+좀더긴거.md
