@@ -15,13 +15,15 @@
 ## 준비
 
 1. Discord Developer Portal에서 Bot을 만듭니다.
-2. OAuth2 URL Generator에서 `bot`, `applications.commands` scope를 선택하고 서버에 초대합니다.
-3. 봇 권한을 줍니다.
+2. Bot 설정에서 `MESSAGE CONTENT INTENT`를 켭니다.
+3. OAuth2 URL Generator에서 `bot`, `applications.commands` scope를 선택하고 서버에 초대합니다.
+4. 봇 권한을 줍니다.
    - 채널 보기
    - 메시지 보내기
    - 파일 첨부
    - 반응 추가
    - 메시지 기록 읽기
+   - 메시지 관리
 
 ## 설정
 
@@ -31,6 +33,7 @@
 DISCORD_TOKEN=봇_토큰
 DISCORD_GUILD_ID=
 SOURCE_CHANNEL_IDS=1509460473060261949
+PROBLEM_CATEGORY_ID=1509459977801044029
 UNIT_CHANNEL_PREFIX=
 UNIT_CHANNEL_MAP=
 ```
@@ -53,6 +56,14 @@ UNIT_CHANNEL_MAP=1:123456789012345678,2:234567890123456789
 - `문제번호`: `1`부터 `50`
 - `단원`: `1`부터 `12`
 - `파일`: 문제 이미지 또는 파일
+
+`/이동`
+
+- `기존단원`: 옮길 문제의 현재 단원
+- `새단원`: 옮겨갈 단원
+- `미리보기`: 켜면 실제로 옮기지 않고 대상 개수만 확인
+
+`/이동`은 `1509459977801044029` 카테고리 안의 채널들을 스캔합니다. 메시지 제목의 `24-2/일반, 35번 -1, 2번` 같은 부분에서 `-1`을 단원으로 읽고, 맞는 문제를 새 단원 채널로 복사한 뒤 원본을 삭제합니다.
 
 ## 실행
 

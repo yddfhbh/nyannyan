@@ -8,6 +8,7 @@ import {
 } from 'discord.js';
 
 const UPLOAD_COMMAND_NAME = '업로드';
+const MOVE_COMMAND_NAME = '이동';
 const YEAR_CHOICES = ['26-1', '25-2', '25-1', '24-2', '24-1', '23'];
 const ANSWER_EMOJIS = new Map([
   ['1️⃣', 1],
@@ -20,6 +21,7 @@ const config = {
   token: process.env.DISCORD_TOKEN,
   guildId: process.env.DISCORD_GUILD_ID || '',
   sourceChannelIds: parseCsv(process.env.SOURCE_CHANNEL_IDS),
+  problemCategoryId: process.env.PROBLEM_CATEGORY_ID || '1509459977801044029',
   unitChannelPrefix: process.env.UNIT_CHANNEL_PREFIX || '',
   unitChannelMap: parseChannelMap(process.env.UNIT_CHANNEL_MAP),
 };
@@ -55,6 +57,30 @@ const commands = [
       option.setName('파일').setDescription('문제 이미지 또는 파일').setRequired(true),
     )
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName(MOVE_COMMAND_NAME)
+    .setDescription('카테고리 안의 특정 단원 문제를 다른 단원 채널로 옮깁니다.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+    .addIntegerOption((option) =>
+      option
+        .setName('기존단원')
+        .setDescription('옮길 문제의 현재 단원')
+        .setRequired(true)
+        .setMinValue(1)
+        .setMaxValue(12),
+    )
+    .addIntegerOption((option) =>
+      option
+        .setName('새단원')
+        .setDescription('옮겨갈 단원')
+        .setRequired(true)
+        .setMinValue(1)
+        .setMaxValue(12),
+    )
+    .addBooleanOption((option) =>
+      option.setName('미리보기').setDescription('실제로 옮기지 않고 대상 개수만 확인합니다.'),
+    )
+    .toJSON(),
 ];
 
 const client = new Client({
@@ -62,6 +88,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.MessageContent,
   ],
   partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User],
 });
@@ -78,13 +105,19 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName !== UPLOAD_COMMAND_NAME) return;
 
   try {
-    await handleUploadCommand(interaction);
+    if (interaction.commandName === UPLOAD_COMMAND_NAME) {
+      await handleUploadCommand(interaction);
+      return;
+    }
+
+    if (interaction.commandName === MOVE_COMMAND_NAME) {
+      await handleMoveCommand(interaction);
+    }
   } catch (error) {
     console.error(error);
-    await safeInteractionError(interaction, '업로드 처리 중 오류가 발생했습니다.');
+    await safeInteractionError(interaction, '명령 처리 중 오류가 발생했습니다.');
   }
 });
 
@@ -163,6 +196,68 @@ async function handleUploadCommand(interaction) {
   await interaction.editReply(`업로드했습니다: ${postedMessage.url}`);
 }
 
+async function handleMoveCommand(interaction) {
+  if (!interaction.inGuild()) {
+    await interaction.reply({ content: '서버 채널에서만 사용할 수 있습니다.', ephemeral: true });
+    return;
+  }
+
+  if (!canManageMessages(interaction)) {
+    await interaction.reply({ content: '`메시지 관리` 권한이 필요합니다.', ephemeral: true });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const fromUnit = String(interaction.options.getInteger('기존단원', true));
+  const toUnit = String(interaction.options.getInteger('새단원', true));
+  const previewOnly = interaction.options.getBoolean('미리보기') ?? false;
+
+  if (fromUnit === toUnit) {
+    await interaction.editReply('기존 단원과 새 단원이 같습니다.');
+    return;
+  }
+
+  const targetChannel = await findUnitChannel(interaction.guild, toUnit);
+  if (!targetChannel) {
+    await interaction.editReply(`새 단원 \`${toUnit}\`에 해당하는 채널을 찾지 못했습니다.`);
+    return;
+  }
+
+  const botMember = await getBotMember(interaction.guild);
+  const targetPermissionError = getUploadPermissionError(targetChannel, botMember);
+  if (targetPermissionError) {
+    await interaction.editReply(targetPermissionError);
+    return;
+  }
+
+  const scanChannels = await getProblemCategoryChannels(interaction.guild);
+  if (scanChannels.length === 0) {
+    await interaction.editReply(`카테고리 \`${config.problemCategoryId}\` 안에서 스캔할 채널을 찾지 못했습니다.`);
+    return;
+  }
+
+  const sourcePermissionError = getCategoryScanPermissionError(scanChannels, botMember);
+  if (sourcePermissionError) {
+    await interaction.editReply(sourcePermissionError);
+    return;
+  }
+
+  await interaction.editReply(
+    `${scanChannels.length}개 채널에서 \`${fromUnit}\`단원 문제를 스캔합니다...`,
+  );
+
+  const result = await moveProblemsBetweenUnits({
+    scanChannels,
+    targetChannel,
+    fromUnit,
+    toUnit,
+    previewOnly,
+  });
+
+  await interaction.editReply(formatMoveResult(result, fromUnit, toUnit, targetChannel, previewOnly));
+}
+
 async function handleAnswerReaction(reaction, user, answer) {
   const fullReaction = await fetchFullReaction(reaction);
   const message = fullReaction.message;
@@ -188,6 +283,70 @@ async function handleAnswerReaction(reaction, user, answer) {
   console.log(
     `Set answer ${answer} for ${problem.year} #${problem.problemNumber} unit ${problem.unit}`,
   );
+}
+
+async function moveProblemsBetweenUnits({ scanChannels, targetChannel, fromUnit, toUnit, previewOnly }) {
+  const result = {
+    scannedChannels: scanChannels.length,
+    scannedMessages: 0,
+    matchedMessages: 0,
+    movedMessages: 0,
+    editedMessages: 0,
+    failedMessages: 0,
+  };
+
+  for (const channel of scanChannels) {
+    for await (const message of fetchAllChannelMessages(channel)) {
+      result.scannedMessages += 1;
+
+      const problem = parseProblemFromMessage(message);
+      if (!problem || problem.unit !== fromUnit) continue;
+
+      result.matchedMessages += 1;
+      if (previewOnly) continue;
+
+      try {
+        await moveSingleProblemMessage(message, problem, targetChannel, toUnit);
+        if (message.channelId === targetChannel.id && message.author.id === client.user.id) {
+          result.editedMessages += 1;
+        } else {
+          result.movedMessages += 1;
+        }
+      } catch (error) {
+        result.failedMessages += 1;
+        console.error(`Failed to move message ${message.id}:`, error);
+      }
+    }
+  }
+
+  return result;
+}
+
+async function moveSingleProblemMessage(message, problem, targetChannel, toUnit) {
+  const movedProblem = {
+    ...problem,
+    unit: toUnit,
+  };
+
+  if (message.channelId === targetChannel.id && message.author.id === client.user.id) {
+    await message.edit({ content: renderProblemContent(movedProblem) });
+    await addMissingAnswerReactions(message);
+    return;
+  }
+
+  const files = [...message.attachments.values()].map((attachment) => ({
+    attachment: attachment.url,
+    name: sanitizeAttachmentName(attachment.name || `${problem.year}-${problem.problemNumber}.png`),
+  }));
+
+  const postedMessage = await targetChannel.send({
+    content: renderProblemContent(movedProblem),
+    files,
+    allowedMentions: { parse: [] },
+  });
+
+  await addAnswerReactions(postedMessage);
+  await message.delete();
 }
 
 async function registerCommands() {
@@ -229,6 +388,22 @@ async function resolveCommandGuildIds() {
   return guildIds;
 }
 
+async function getProblemCategoryChannels(guild) {
+  await guild.channels.fetch().catch(() => undefined);
+
+  return [...guild.channels.cache.values()]
+    .filter(
+      (channel) =>
+        channel.parentId === config.problemCategoryId &&
+        isScannableTextChannel(channel) &&
+        !channel.isThread?.(),
+    )
+    .sort((a, b) => {
+      if (a.rawPosition !== b.rawPosition) return a.rawPosition - b.rawPosition;
+      return a.name.localeCompare(b.name);
+    });
+}
+
 async function findUnitChannel(guild, unit) {
   const mappedChannelId = config.unitChannelMap.get(unit);
   if (mappedChannelId) {
@@ -247,6 +422,33 @@ async function findUnitChannel(guild, unit) {
 async function addAnswerReactions(message) {
   for (const emoji of ANSWER_EMOJIS.keys()) {
     await message.react(emoji);
+  }
+}
+
+async function addMissingAnswerReactions(message) {
+  for (const emoji of ANSWER_EMOJIS.keys()) {
+    if (!message.reactions.cache.has(emoji)) {
+      await message.react(emoji);
+    }
+  }
+}
+
+async function* fetchAllChannelMessages(channel) {
+  let before;
+
+  while (true) {
+    const options = { limit: 100 };
+    if (before) options.before = before;
+
+    const batch = await channel.messages.fetch(options);
+    if (batch.size === 0) break;
+
+    for (const message of batch.values()) {
+      yield message;
+    }
+
+    before = batch.last().id;
+    if (batch.size < 100) break;
   }
 }
 
@@ -274,21 +476,53 @@ async function removeReactionFromUser(reaction, user) {
   await reaction.users.remove(user.id).catch(() => undefined);
 }
 
+function parseProblemFromMessage(message) {
+  const header = parseProblemHeader(message.content || '');
+  if (!header) return null;
+
+  const answerMatch = (message.content || '').match(/^정답:\s*(?:(?<answer>[1-4])번|미선택)$/m);
+  const uploaderMatch = (message.content || '').match(/^업로더:\s*<@!?(?<uploaderId>\d+)>$/m);
+  const answer = answerMatch?.groups?.answer
+    ? Number(answerMatch.groups.answer)
+    : header.answer;
+
+  return {
+    year: header.year,
+    problemNumber: header.problemNumber,
+    unit: header.unit,
+    answer,
+    uploaderId: uploaderMatch?.groups?.uploaderId || message.author.id,
+  };
+}
+
 function parsePublishedProblem(content) {
-  const titleMatch = content.match(
-    /^(?<year>26-1|25-2|25-1|24-2|24-1|23)\/일반,\s*(?<problemNumber>\d{1,2})번\s*-(?<unit>\d{1,2})/m,
-  );
+  const titleMatch = parseProblemHeader(content);
   const answerMatch = content.match(/^정답:\s*(?:(?<answer>[1-4])번|미선택)$/m);
   const uploaderMatch = content.match(/^업로더:\s*<@!?(?<uploaderId>\d+)>$/m);
 
-  if (!titleMatch?.groups || !uploaderMatch?.groups) return null;
+  if (!titleMatch || !uploaderMatch?.groups) return null;
 
   return {
-    year: titleMatch.groups.year,
-    problemNumber: Number(titleMatch.groups.problemNumber),
-    unit: String(Number(titleMatch.groups.unit)),
+    year: titleMatch.year,
+    problemNumber: titleMatch.problemNumber,
+    unit: titleMatch.unit,
     answer: answerMatch?.groups?.answer ? Number(answerMatch.groups.answer) : null,
     uploaderId: uploaderMatch.groups.uploaderId,
+  };
+}
+
+function parseProblemHeader(content) {
+  const match = content.match(
+    /^(?<year>26-1|25-2|25-1|24-2|24-1|23)\/일반,\s*(?<problemNumber>\d{1,2})번\s*-\s*(?<unit>\d{1,2})(?:\s*,\s*(?<answer>[1-4])번)?/m,
+  );
+
+  if (!match?.groups) return null;
+
+  return {
+    year: match.groups.year,
+    problemNumber: Number(match.groups.problemNumber),
+    unit: String(Number(match.groups.unit)),
+    answer: match.groups.answer ? Number(match.groups.answer) : null,
   };
 }
 
@@ -299,6 +533,29 @@ function renderProblemContent(problem) {
     `${problem.year}/일반, ${problem.problemNumber}번 -${problem.unit}`,
     `정답: ${answerText}`,
     `업로더: <@${problem.uploaderId}>`,
+  ].join('\n');
+}
+
+function formatMoveResult(result, fromUnit, toUnit, targetChannel, previewOnly) {
+  if (previewOnly) {
+    return [
+      '미리보기 완료',
+      `스캔 채널: ${result.scannedChannels}개`,
+      `스캔 메시지: ${result.scannedMessages}개`,
+      `이동 대상: ${result.matchedMessages}개`,
+      `대상 채널: <#${targetChannel.id}>`,
+    ].join('\n');
+  }
+
+  return [
+    `\`${fromUnit}\`단원 문제를 \`${toUnit}\`단원으로 이동했습니다.`,
+    `스캔 채널: ${result.scannedChannels}개`,
+    `스캔 메시지: ${result.scannedMessages}개`,
+    `대상 메시지: ${result.matchedMessages}개`,
+    `이동: ${result.movedMessages}개`,
+    `같은 채널에서 수정: ${result.editedMessages}개`,
+    `실패: ${result.failedMessages}개`,
+    `대상 채널: <#${targetChannel.id}>`,
   ].join('\n');
 }
 
@@ -314,6 +571,27 @@ function validateUploadOptions(year, problemNumber, unit) {
   }
 
   return '';
+}
+
+function getCategoryScanPermissionError(channels, botMember) {
+  const missingChannels = channels
+    .map((channel) => ({
+      channel,
+      permissions: channel.permissionsFor(botMember),
+    }))
+    .filter(
+      ({ permissions }) =>
+        !permissions?.has(PermissionFlagsBits.ViewChannel) ||
+        !permissions?.has(PermissionFlagsBits.ReadMessageHistory) ||
+        !permissions?.has(PermissionFlagsBits.ManageMessages),
+    )
+    .map(({ channel }) => `<#${channel.id}>`);
+
+  if (missingChannels.length === 0) return '';
+
+  const visible = missingChannels.slice(0, 5).join(', ');
+  const suffix = missingChannels.length > 5 ? ` 외 ${missingChannels.length - 5}개` : '';
+  return `카테고리 안의 일부 채널에서 \`채널 보기\`, \`메시지 기록 읽기\`, \`메시지 관리\` 권한이 부족합니다: ${visible}${suffix}`;
 }
 
 function getUploadPermissionError(targetChannel, botMember) {
@@ -342,6 +620,13 @@ function getUploadPermissionError(targetChannel, botMember) {
   return '';
 }
 
+function canManageMessages(interaction) {
+  return (
+    interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
+    interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)
+  );
+}
+
 async function safeInteractionError(interaction, message) {
   if (interaction.deferred || interaction.replied) {
     await interaction.editReply(message).catch(() => undefined);
@@ -365,6 +650,10 @@ function formatAllowedSourceChannels() {
 
 function isSendableTextChannel(channel) {
   return Boolean(channel?.isTextBased?.() && typeof channel.send === 'function');
+}
+
+function isScannableTextChannel(channel) {
+  return Boolean(isSendableTextChannel(channel) && channel.messages?.fetch);
 }
 
 function normalizeChannelName(value) {
