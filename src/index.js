@@ -180,7 +180,6 @@ async function handleUploadCommand(interaction) {
     unit,
     answer: null,
     answerInHeader: false,
-    uploaderId: interaction.user.id,
   };
   const postedMessage = await targetChannel.send({
     content: renderProblemContent(problem),
@@ -267,11 +266,6 @@ async function handleAnswerReaction(reaction, user, answer) {
 
   const problem = parsePublishedProblem(message.content || '');
   if (!problem) return;
-
-  if (problem.uploaderId !== user.id) {
-    await removeReactionFromUser(fullReaction, user);
-    return;
-  }
 
   await message.edit({
     content: renderProblemContent({
@@ -482,7 +476,6 @@ function parseProblemFromMessage(message) {
   if (!header) return null;
 
   const answerMatch = (message.content || '').match(/^정답:\s*(?:(?<answer>[1-4])번|미선택)$/m);
-  const uploaderMatch = (message.content || '').match(/^업로더:\s*<@!?(?<uploaderId>\d+)>$/m);
   const answer = answerMatch?.groups?.answer
     ? Number(answerMatch.groups.answer)
     : header.answer;
@@ -493,16 +486,14 @@ function parseProblemFromMessage(message) {
     unit: header.unit,
     answer,
     answerInHeader: Boolean(header.answer),
-    uploaderId: uploaderMatch?.groups?.uploaderId || message.author.id,
   };
 }
 
 function parsePublishedProblem(content) {
   const titleMatch = parseProblemHeader(content);
   const answerMatch = content.match(/^정답:\s*(?:(?<answer>[1-4])번|미선택)$/m);
-  const uploaderMatch = content.match(/^업로더:\s*<@!?(?<uploaderId>\d+)>$/m);
 
-  if (!titleMatch || !uploaderMatch?.groups) return null;
+  if (!titleMatch) return null;
 
   return {
     year: titleMatch.year,
@@ -510,7 +501,6 @@ function parsePublishedProblem(content) {
     unit: titleMatch.unit,
     answer: answerMatch?.groups?.answer ? Number(answerMatch.groups.answer) : titleMatch.answer,
     answerInHeader: Boolean(titleMatch.answer),
-    uploaderId: uploaderMatch.groups.uploaderId,
   };
 }
 
@@ -538,8 +528,6 @@ function renderProblemContent(problem) {
   if (!answerSuffix) {
     lines.push(`정답: ${answerText}`);
   }
-
-  lines.push(`업로더: <@${problem.uploaderId}>`);
 
   return lines.join('\n');
 }
