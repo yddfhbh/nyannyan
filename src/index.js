@@ -9,6 +9,8 @@ import {
 
 const UPLOAD_COMMAND_NAME = '업로드';
 const MOVE_COMMAND_NAME = '이동';
+const REPLY_MOVE_MIN_UNIT = 1;
+const REPLY_MOVE_MAX_UNIT = 10;
 const YEAR_CHOICES = ['26-1', '25-2', '25-1', '24-2', '24-1', '23'];
 const ANSWER_EMOJIS = new Map([
   ['1️⃣', 1],
@@ -134,6 +136,16 @@ client.on('messageReactionAdd', async (reaction, user) => {
   }
 });
 
+client.on('messageCreate', async (message) => {
+  if (message.author.bot || !message.guild) return;
+
+  try {
+    await handleReplyMoveMessage(message);
+  } catch (error) {
+    console.error(error);
+  }
+});
+
 async function handleUploadCommand(interaction) {
   if (!interaction.inGuild()) {
     await interaction.reply({ content: '서버 채널에서만 사용할 수 있습니다.', ephemeral: true });
@@ -193,7 +205,7 @@ async function handleUploadCommand(interaction) {
   });
 
   await addAnswerReactions(postedMessage);
-  await interaction.editReply(`업로드했습니다: ${postedMessage.url}`);
+  await interaction.deleteReply().catch(() => undefined);
 }
 
 async function handleMoveCommand(interaction) {
@@ -277,6 +289,38 @@ async function handleAnswerReaction(reaction, user, answer) {
 
   console.log(
     `Set answer ${answer} for ${problem.year} #${problem.problemNumber} unit ${problem.unit}`,
+  );
+}
+
+async function handleReplyMoveMessage(message) {
+  const toUnit = parseReplyMoveUnit(message.content);
+  if (!toUnit || !message.reference?.messageId) return;
+  if (!canManageMessagesInChannel(message.channel, message.member)) return;
+
+  const referencedMessage = await fetchReferencedMessage(message);
+  if (!referencedMessage || referencedMessage.author?.id !== client.user.id) return;
+
+  const problem = parseProblemFromMessage(referencedMessage);
+  if (!problem) return;
+
+  const targetChannel = await findUnitChannel(message.guild, toUnit);
+  if (!targetChannel) {
+    console.warn(`Cannot move message ${referencedMessage.id}: missing unit channel ${toUnit}`);
+    return;
+  }
+
+  const botMember = await getBotMember(message.guild);
+  const permissionError = getReplyMovePermissionError(referencedMessage, targetChannel, botMember);
+  if (permissionError) {
+    console.warn(`Cannot move message ${referencedMessage.id}: ${permissionError}`);
+    return;
+  }
+
+  await moveSingleProblemMessage(referencedMessage, problem, targetChannel, toUnit);
+  await message.delete().catch(() => undefined);
+
+  console.log(
+    `Moved replied problem ${problem.year} #${problem.problemNumber} to unit ${toUnit}`,
   );
 }
 
@@ -456,6 +500,20 @@ async function fetchFullReaction(reaction) {
   return fullReaction;
 }
 
+async function fetchReferencedMessage(message) {
+  const messageId = message.reference?.messageId;
+  if (!messageId) return null;
+
+  const channelId = message.reference.channelId || message.channelId;
+  const channel =
+    channelId === message.channelId
+      ? message.channel
+      : await client.channels.fetch(channelId).catch(() => null);
+  if (!isScannableTextChannel(channel)) return null;
+
+  return channel.messages.fetch(messageId).catch(() => null);
+}
+
 async function removeOtherAnswerReactions(message, user, selectedEmoji) {
   for (const emoji of ANSWER_EMOJIS.keys()) {
     if (emoji === selectedEmoji) continue;
@@ -569,6 +627,24 @@ function validateUploadOptions(year, problemNumber, unit) {
   return '';
 }
 
+function getReplyMovePermissionError(sourceMessage, targetChannel, botMember) {
+  const sourcePermissions = sourceMessage.channel.permissionsFor(botMember);
+
+  if (!sourcePermissions?.has(PermissionFlagsBits.ViewChannel)) {
+    return `원본 채널 <#${sourceMessage.channelId}>을 볼 권한이 없습니다.`;
+  }
+
+  if (!sourcePermissions?.has(PermissionFlagsBits.ReadMessageHistory)) {
+    return `원본 채널 <#${sourceMessage.channelId}>의 메시지 기록을 읽을 권한이 없습니다.`;
+  }
+
+  if (!sourcePermissions?.has(PermissionFlagsBits.ManageMessages)) {
+    return `원본 채널 <#${sourceMessage.channelId}>에서 메시지를 지울 권한이 없습니다.`;
+  }
+
+  return getUploadPermissionError(targetChannel, botMember);
+}
+
 function getCategoryScanPermissionError(channels, botMember) {
   const missingChannels = channels
     .map((channel) => ({
@@ -617,9 +693,18 @@ function getUploadPermissionError(targetChannel, botMember) {
 }
 
 function canManageMessages(interaction) {
-  return (
-    interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
-    interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)
+  return hasManageMessagesPermission(interaction.memberPermissions);
+}
+
+function canManageMessagesInChannel(channel, member) {
+  if (!channel || !member) return false;
+  return hasManageMessagesPermission(channel.permissionsFor(member));
+}
+
+function hasManageMessagesPermission(permissions) {
+  return Boolean(
+    permissions?.has(PermissionFlagsBits.Administrator) ||
+      permissions?.has(PermissionFlagsBits.ManageMessages),
   );
 }
 
@@ -662,6 +747,22 @@ function sanitizeAttachmentName(value) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 120);
+}
+
+function parseReplyMoveUnit(content) {
+  const trimmed = content.trim();
+  if (!/^\d{1,2}$/.test(trimmed)) return null;
+
+  const unit = Number(trimmed);
+  if (
+    !Number.isInteger(unit) ||
+    unit < REPLY_MOVE_MIN_UNIT ||
+    unit > REPLY_MOVE_MAX_UNIT
+  ) {
+    return null;
+  }
+
+  return String(unit);
 }
 
 function parseCsv(value) {
