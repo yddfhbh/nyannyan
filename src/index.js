@@ -45,7 +45,7 @@ const commands = [
         .setDescription('문제 번호')
         .setRequired(true)
         .setMinValue(1)
-        .setMaxValue(50),
+        .setMaxValue(60),
     )
     .addIntegerOption((option) =>
       option
@@ -615,8 +615,8 @@ function formatMoveResult(result, fromUnit, toUnit, targetChannel, previewOnly) 
 
 function validateUploadOptions(year, problemNumber, unit) {
   if (!YEAR_CHOICES.includes(year)) return '지원하지 않는 년도입니다.';
-  if (!Number.isInteger(problemNumber) || problemNumber < 1 || problemNumber > 50) {
-    return '문제 번호는 1번부터 50번까지만 가능합니다.';
+  if (!Number.isInteger(problemNumber) || problemNumber < 1 || problemNumber > 60) {
+    return '문제 번호는 1번부터 60번까지만 가능합니다.';
   }
 
   const unitNumber = Number(unit);
