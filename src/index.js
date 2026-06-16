@@ -28,6 +28,26 @@ const config = {
   unitChannelMap: parseChannelMap(process.env.UNIT_CHANNEL_MAP),
 };
 
+const liveNotifierConfig = {
+  alertChannelId: process.env.LIVE_ALERT_CHANNEL_ID || '1516330161178546201',
+  intervalMs: Math.max(30_000, Number(process.env.LIVE_CHECK_INTERVAL_MS || 60_000)),
+  batchSize: Math.max(1, Number(process.env.LIVE_CHECK_BATCH_SIZE || 100)),
+  baseUrl: process.env.VSTOCK_BASE_URL || 'https://virtual-stock.xyz',
+  stockPageSize: Math.max(1, Number(process.env.VSTOCK_STOCKS_PAGE_SIZE || 100)),
+  stockScanPages: Math.max(1, Number(process.env.VSTOCK_STOCKS_SCAN_PAGES || 30)),
+  notifyOnBoot: parseBoolean(process.env.VSTOCK_NOTIFY_ON_BOOT),
+  poolRefreshMs: Math.max(60_000, Number(process.env.VSTOCK_POOL_REFRESH_MS || 10 * 60_000)),
+};
+
+let liveNotifierStarted = false;
+let liveCheckRunning = false;
+let livePoolRefreshing = false;
+let liveStateInitialized = false;
+let lastLivePoolRefreshAt = 0;
+let streamerPool = [];
+let shuffledStreamerQueue = [];
+const liveStateByChannelId = new Map();
+
 const commands = [
   new SlashCommandBuilder()
     .setName(UPLOAD_COMMAND_NAME)
@@ -97,12 +117,13 @@ const client = new Client({
 
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
-
   try {
     await registerCommands();
   } catch (error) {
     console.error('Failed to register slash commands:', error);
   }
+
+  startLiveNotifier();
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -784,6 +805,426 @@ function parseChannelMap(value) {
   }
 
   return map;
+}
+
+function startLiveNotifier() {
+  if (liveNotifierStarted) return;
+  liveNotifierStarted = true;
+
+  if (!liveNotifierConfig.alertChannelId) {
+    console.log('Live notifier disabled: LIVE_ALERT_CHANNEL_ID is empty.');
+    return;
+  }
+
+  console.log(
+    [
+      'Live notifier enabled.',
+      `channel=${liveNotifierConfig.alertChannelId}`,
+      `interval=${liveNotifierConfig.intervalMs}ms`,
+      `batch=${liveNotifierConfig.batchSize}`,
+      `poolRefresh=${liveNotifierConfig.poolRefreshMs}ms`,
+    ].join(' '),
+  );
+
+  runLiveCheck({ isBoot: true }).catch((error) => {
+    console.error('Initial live check failed:', error);
+  });
+
+  setInterval(() => {
+    runLiveCheck().catch((error) => {
+      console.error('Live check failed:', error);
+    });
+  }, liveNotifierConfig.intervalMs);
+}
+
+async function runLiveCheck({ isBoot = false } = {}) {
+  if (liveCheckRunning) return;
+  liveCheckRunning = true;
+
+  try {
+    const alertChannel = await client.channels
+      .fetch(liveNotifierConfig.alertChannelId)
+      .catch(() => null);
+
+    if (!isSendableTextChannel(alertChannel)) {
+      console.warn(`Live alert channel is not sendable: ${liveNotifierConfig.alertChannelId}`);
+      return;
+    }
+
+    await refreshStreamerPoolIfNeeded();
+
+    if (streamerPool.length === 0) {
+      console.warn('Live check skipped: streamer pool is empty.');
+      liveStateInitialized = true;
+      return;
+    }
+
+    refillShuffledStreamerQueueIfNeeded();
+
+    const batch = shuffledStreamerQueue.splice(0, liveNotifierConfig.batchSize);
+    let checkedCount = 0;
+    let liveCount = 0;
+    let notifiedCount = 0;
+    let failedCount = 0;
+
+    for (const streamer of batch) {
+      try {
+        const status = await fetchChzzkLiveStatus(streamer.chzzkChannelId);
+        checkedCount += 1;
+
+        const nowLive = status.isLive;
+        const wasLive = liveStateByChannelId.get(streamer.chzzkChannelId) === true;
+
+        if (nowLive) liveCount += 1;
+
+        const shouldNotify =
+          nowLive &&
+          ((liveStateInitialized && !wasLive) ||
+            (!liveStateInitialized && isBoot && liveNotifierConfig.notifyOnBoot));
+
+        liveStateByChannelId.set(streamer.chzzkChannelId, nowLive);
+
+        if (shouldNotify) {
+          await alertChannel.send({
+            content: `${streamer.name} 방송 ON`,
+            allowedMentions: { parse: [] },
+          });
+          notifiedCount += 1;
+          await sleep(300);
+        }
+      } catch (error) {
+        failedCount += 1;
+        console.warn(
+          `Failed to check live status: ${streamer.name} (${streamer.chzzkChannelId}) - ${error.message}`,
+        );
+      }
+
+      await sleep(150);
+    }
+
+    liveStateInitialized = true;
+
+    console.log(
+      [
+        'Live check done.',
+        `pool=${streamerPool.length}`,
+        `queueLeft=${shuffledStreamerQueue.length}`,
+        `batch=${batch.length}`,
+        `checked=${checkedCount}`,
+        `live=${liveCount}`,
+        `notified=${notifiedCount}`,
+        `failed=${failedCount}`,
+      ].join(' '),
+    );
+  } finally {
+    liveCheckRunning = false;
+  }
+}
+
+async function refreshStreamerPoolIfNeeded({ force = false } = {}) {
+  if (livePoolRefreshing) return;
+
+  const now = Date.now();
+  const shouldRefresh =
+    force ||
+    streamerPool.length === 0 ||
+    now - lastLivePoolRefreshAt >= liveNotifierConfig.poolRefreshMs;
+
+  if (!shouldRefresh) return;
+
+  livePoolRefreshing = true;
+
+  try {
+    const items = await fetchVirtualStockItems();
+    const parsed = [];
+
+    for (const item of items) {
+      const streamer = normalizeVirtualStockStreamer(item);
+      if (!streamer) continue;
+      parsed.push(streamer);
+    }
+
+    const deduped = dedupeStreamersByChannelId(parsed);
+
+    streamerPool = deduped;
+    shuffledStreamerQueue = [];
+    lastLivePoolRefreshAt = now;
+
+    console.log(
+      `Live streamer pool refreshed. raw=${items.length}, parsed=${parsed.length}, deduped=${streamerPool.length}`,
+    );
+  } finally {
+    livePoolRefreshing = false;
+  }
+}
+
+async function fetchVirtualStockItems() {
+  const allItems = [];
+  const seenKeys = new Set();
+
+  for (let page = 1; page <= liveNotifierConfig.stockScanPages; page += 1) {
+    const data = await fetchVirtualStockPage(page, liveNotifierConfig.stockPageSize);
+    const rows = extractArrayFromVirtualStockResponse(data);
+
+    if (rows.length === 0) break;
+
+    for (const row of rows) {
+      const key =
+        getFirstString(row, ['id', 'stockId', 'symbol', 'code']) ||
+        getNestedString(row, ['streamer', 'id']) ||
+        getNestedString(row, ['channel', 'id']) ||
+        getFirstString(row, ['chzzkChannelId', 'channelId']) ||
+        JSON.stringify(row).slice(0, 120);
+
+      if (seenKeys.has(key)) continue;
+
+      seenKeys.add(key);
+      allItems.push(row);
+    }
+
+    if (rows.length < liveNotifierConfig.stockPageSize) break;
+    await sleep(200);
+  }
+
+  return allItems;
+}
+
+async function fetchVirtualStockPage(page, pageSize) {
+  const baseUrl = liveNotifierConfig.baseUrl.replace(/\/+$/, '');
+
+  const urls = [
+    `${baseUrl}/api/stocks?page=${page}&limit=${pageSize}&sort=change_rate&order=desc`,
+    `${baseUrl}/api/stocks?page=${page}&size=${pageSize}&sort=change_rate&order=desc`,
+    `${baseUrl}/api/stocks?page=${page}&pageSize=${pageSize}&sort=change_rate&order=desc`,
+    `${baseUrl}/api/stocks?sort=change_rate&order=desc&page=${page}&limit=${pageSize}`,
+  ];
+
+  if (page === 1) {
+    urls.push(`${baseUrl}/api/stocks?sort=change_rate&order=desc`);
+  }
+
+  let lastError = null;
+
+  for (const url of urls) {
+    try {
+      return await fetchJson(url);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error('Failed to fetch virtual-stock stocks');
+}
+
+function extractArrayFromVirtualStockResponse(data) {
+  if (Array.isArray(data)) return data;
+
+  const candidates = [
+    data,
+    data?.data,
+    data?.content,
+    data?.result,
+    data?.payload,
+    data?.data?.data,
+    data?.data?.content,
+    data?.content?.data,
+    data?.result?.data,
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate;
+
+    if (candidate && typeof candidate === 'object') {
+      for (const key of ['stocks', 'items', 'rows', 'results', 'list', 'data', 'content']) {
+        if (Array.isArray(candidate[key])) return candidate[key];
+      }
+    }
+  }
+
+  return [];
+}
+
+function normalizeVirtualStockStreamer(item) {
+  const name =
+    getFirstString(item, [
+      'name',
+      'stockName',
+      'displayName',
+      'streamerName',
+      'channelName',
+      'nickname',
+      'title',
+    ]) ||
+    getNestedString(item, ['streamer', 'name']) ||
+    getNestedString(item, ['streamer', 'channelName']) ||
+    getNestedString(item, ['streamer', 'nickname']) ||
+    getNestedString(item, ['channel', 'channelName']) ||
+    getNestedString(item, ['creator', 'name']);
+
+  const chzzkChannelId =
+    getFirstString(item, [
+      'chzzkChannelId',
+      'channelId',
+      'streamerChannelId',
+      'chzzkId',
+      'chzzk_channel_id',
+    ]) ||
+    getNestedString(item, ['streamer', 'chzzkChannelId']) ||
+    getNestedString(item, ['streamer', 'channelId']) ||
+    getNestedString(item, ['streamer', 'chzzkId']) ||
+    getNestedString(item, ['channel', 'channelId']) ||
+    getNestedString(item, ['channel', 'chzzkChannelId']);
+
+  if (!name || !chzzkChannelId) return null;
+
+  return {
+    name,
+    chzzkChannelId,
+  };
+}
+
+function dedupeStreamersByChannelId(streamers) {
+  const map = new Map();
+
+  for (const streamer of streamers) {
+    if (!streamer.chzzkChannelId) continue;
+
+    const key = String(streamer.chzzkChannelId);
+    if (!map.has(key)) {
+      map.set(key, {
+        name: streamer.name,
+        chzzkChannelId: key,
+      });
+    }
+  }
+
+  return [...map.values()];
+}
+
+function refillShuffledStreamerQueueIfNeeded() {
+  if (shuffledStreamerQueue.length > 0) return;
+
+  shuffledStreamerQueue = shuffleArray([...streamerPool]);
+
+  console.log(`Live streamer queue refilled. size=${shuffledStreamerQueue.length}`);
+}
+
+function shuffleArray(items) {
+  for (let index = items.length - 1; index > 0; index -= 1) {
+    const randomIndex = Math.floor(Math.random() * (index + 1));
+    [items[index], items[randomIndex]] = [items[randomIndex], items[index]];
+  }
+
+  return items;
+}
+
+async function fetchChzzkLiveStatus(channelId) {
+  const urls = [
+    `https://api.chzzk.naver.com/polling/v2/channels/${encodeURIComponent(channelId)}/live-status`,
+    `https://api.chzzk.naver.com/polling/v1/channels/${encodeURIComponent(channelId)}/live-status`,
+  ];
+
+  let lastError = null;
+
+  for (const url of urls) {
+    try {
+      const data = await fetchJson(url);
+      const content = data?.content ?? data;
+
+      const statusText = String(content?.status || '').trim().toUpperCase();
+      const liveTitle = typeof content?.liveTitle === 'string' ? content.liveTitle : '';
+      const chatChannelId = typeof content?.chatChannelId === 'string' ? content.chatChannelId : '';
+
+      const isLive =
+        ['OPEN', 'LIVE', 'ON', 'ONAIR', 'ON_AIR', 'STREAMING'].includes(statusText) ||
+        Boolean(liveTitle) ||
+        Boolean(chatChannelId);
+
+      return {
+        isLive,
+        status: statusText,
+        liveTitle,
+        chatChannelId,
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error(`Failed to fetch CHZZK live status: ${channelId}`);
+}
+
+async function fetchJson(url) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        accept: 'application/json,text/plain,*/*',
+        'user-agent': 'Mozilla/5.0 nyannyan-problem-bot/1.0',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${response.statusText} from ${url}`);
+    }
+
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseBoolean(value) {
+  const parsed = parseBooleanLike(value);
+  return parsed === true;
+}
+
+function parseBooleanLike(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value > 0;
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+
+    if (['true', '1', 'yes', 'y', 'on', 'live'].includes(normalized)) return true;
+    if (['false', '0', 'no', 'n', 'off', 'offline'].includes(normalized)) return false;
+  }
+
+  return null;
+}
+
+function getFirstString(object, keys) {
+  if (!object || typeof object !== 'object') return '';
+
+  for (const key of keys) {
+    const value = object[key];
+
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+
+  return '';
+}
+
+function getNestedString(object, path) {
+  let current = object;
+
+  for (const key of path) {
+    if (!current || typeof current !== 'object') return '';
+    current = current[key];
+  }
+
+  if (typeof current === 'string' && current.trim()) return current.trim();
+  if (typeof current === 'number' && Number.isFinite(current)) return String(current);
+
+  return '';
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function assertConfig() {
