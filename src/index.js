@@ -128,7 +128,7 @@ client.once('ready', async () => {
     console.error('Failed to register slash commands:', error);
   }
 
-  startLiveNotifier();
+
 });
 
 client.on('interactionCreate', async (interaction) => {
