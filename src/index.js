@@ -939,7 +939,24 @@ async function refreshStreamerPoolIfNeeded({ force = false } = {}) {
     const parsed = [];
 
     for (const item of items) {
-      const streamer = normalizeVirtualStockStreamer(item);
+      let streamer = normalizeVirtualStockStreamer(item);
+
+      if (!streamer) {
+        const detail = await fetchVirtualStockDetailFromListItem(item).catch((error) => {
+          console.warn(`Failed to fetch stock detail: ${error.message}`);
+          return null;
+        });
+
+        if (detail) {
+          streamer = normalizeVirtualStockStreamer({
+            ...item,
+            detail,
+          });
+        }
+
+        await sleep(100);
+      }
+
       if (!streamer) continue;
       parsed.push(streamer);
     }
@@ -953,6 +970,11 @@ async function refreshStreamerPoolIfNeeded({ force = false } = {}) {
     console.log(
       `Live streamer pool refreshed. raw=${items.length}, parsed=${parsed.length}, deduped=${streamerPool.length}`,
     );
+
+    if (items.length > 0 && parsed.length === 0) {
+      console.log('Virtual-stock sample keys:', Object.keys(items[0] || {}).join(', '));
+      console.log('Virtual-stock sample json:', JSON.stringify(items[0]).slice(0, 2000));
+    }
   } finally {
     livePoolRefreshing = false;
   }
@@ -991,11 +1013,14 @@ async function fetchVirtualStockItems() {
 
 async function fetchVirtualStockPage(page, pageSize) {
   const baseUrl = liveNotifierConfig.baseUrl.replace(/\/+$/, '');
+  const offset = (page - 1) * pageSize;
 
   const urls = [
     `${baseUrl}/api/stocks?page=${page}&limit=${pageSize}&sort=change_rate&order=desc`,
     `${baseUrl}/api/stocks?page=${page}&size=${pageSize}&sort=change_rate&order=desc`,
     `${baseUrl}/api/stocks?page=${page}&pageSize=${pageSize}&sort=change_rate&order=desc`,
+    `${baseUrl}/api/stocks?offset=${offset}&limit=${pageSize}&sort=change_rate&order=desc`,
+    `${baseUrl}/api/stocks?skip=${offset}&take=${pageSize}&sort=change_rate&order=desc`,
     `${baseUrl}/api/stocks?sort=change_rate&order=desc&page=${page}&limit=${pageSize}`,
   ];
 
@@ -1003,15 +1028,25 @@ async function fetchVirtualStockPage(page, pageSize) {
     urls.push(`${baseUrl}/api/stocks?sort=change_rate&order=desc`);
   }
 
+  let bestData = null;
+  let bestRows = [];
   let lastError = null;
 
   for (const url of urls) {
     try {
-      return await fetchJson(url);
+      const data = await fetchJson(url);
+      const rows = extractArrayFromVirtualStockResponse(data);
+
+      if (rows.length > bestRows.length) {
+        bestData = data;
+        bestRows = rows;
+      }
     } catch (error) {
       lastError = error;
     }
   }
+
+  if (bestData) return bestData;
 
   throw lastError || new Error('Failed to fetch virtual-stock stocks');
 }
@@ -1045,7 +1080,58 @@ function extractArrayFromVirtualStockResponse(data) {
 }
 
 function normalizeVirtualStockStreamer(item) {
-  const name =
+  const name = extractStreamerName(item);
+  const chzzkChannelId = extractChzzkChannelId(item);
+
+  if (!name || !chzzkChannelId) return null;
+
+  return {
+    name,
+    chzzkChannelId,
+  };
+}
+
+async function fetchVirtualStockDetailFromListItem(item) {
+  const stockId = extractStockId(item);
+
+  if (!stockId) {
+    throw new Error('stock id not found in list item');
+  }
+
+  const baseUrl = liveNotifierConfig.baseUrl.replace(/\/+$/, '');
+
+  const urls = [
+    `${baseUrl}/api/stocks/${encodeURIComponent(stockId)}`,
+    `${baseUrl}/api/stocks/detail/${encodeURIComponent(stockId)}`,
+    `${baseUrl}/api/stocks?id=${encodeURIComponent(stockId)}`,
+  ];
+
+  let lastError = null;
+
+  for (const url of urls) {
+    try {
+      return await fetchJson(url);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error(`failed to fetch stock detail: ${stockId}`);
+}
+
+function extractStockId(item) {
+  return (
+    getFirstString(item, ['id', 'stockId', 'stock_id', 'symbol', 'code']) ||
+    getNestedString(item, ['stock', 'id']) ||
+    getNestedString(item, ['stock', 'stockId']) ||
+    getNestedString(item, ['detail', 'id']) ||
+    getNestedString(item, ['detail', 'stockId']) ||
+    ''
+  );
+}
+
+function extractStreamerName(item) {
+  return (
     getFirstString(item, [
       'name',
       'stockName',
@@ -1055,32 +1141,114 @@ function normalizeVirtualStockStreamer(item) {
       'nickname',
       'title',
     ]) ||
+    getNestedString(item, ['stock', 'name']) ||
+    getNestedString(item, ['stock', 'stockName']) ||
     getNestedString(item, ['streamer', 'name']) ||
     getNestedString(item, ['streamer', 'channelName']) ||
     getNestedString(item, ['streamer', 'nickname']) ||
     getNestedString(item, ['channel', 'channelName']) ||
-    getNestedString(item, ['creator', 'name']);
+    getNestedString(item, ['creator', 'name']) ||
+    getNestedString(item, ['detail', 'name']) ||
+    getNestedString(item, ['detail', 'stockName']) ||
+    getNestedString(item, ['detail', 'streamerName']) ||
+    getNestedString(item, ['detail', 'channelName']) ||
+    getNestedString(item, ['detail', 'streamer', 'name']) ||
+    getNestedString(item, ['detail', 'streamer', 'channelName']) ||
+    getNestedString(item, ['detail', 'channel', 'channelName']) ||
+    ''
+  );
+}
 
-  const chzzkChannelId =
+function extractChzzkChannelId(item) {
+  const direct =
     getFirstString(item, [
       'chzzkChannelId',
       'channelId',
       'streamerChannelId',
       'chzzkId',
       'chzzk_channel_id',
+      'chzzkChannelUID',
+      'channelUid',
+      'channelUID',
     ]) ||
+    getNestedString(item, ['stock', 'chzzkChannelId']) ||
+    getNestedString(item, ['stock', 'channelId']) ||
     getNestedString(item, ['streamer', 'chzzkChannelId']) ||
     getNestedString(item, ['streamer', 'channelId']) ||
     getNestedString(item, ['streamer', 'chzzkId']) ||
     getNestedString(item, ['channel', 'channelId']) ||
-    getNestedString(item, ['channel', 'chzzkChannelId']);
+    getNestedString(item, ['channel', 'chzzkChannelId']) ||
+    getNestedString(item, ['detail', 'chzzkChannelId']) ||
+    getNestedString(item, ['detail', 'channelId']) ||
+    getNestedString(item, ['detail', 'streamerChannelId']) ||
+    getNestedString(item, ['detail', 'streamer', 'chzzkChannelId']) ||
+    getNestedString(item, ['detail', 'streamer', 'channelId']) ||
+    getNestedString(item, ['detail', 'channel', 'channelId']) ||
+    getNestedString(item, ['detail', 'channel', 'chzzkChannelId']);
 
-  if (!name || !chzzkChannelId) return null;
+  if (direct && looksLikeChzzkChannelId(direct)) {
+    return direct;
+  }
 
-  return {
-    name,
-    chzzkChannelId,
-  };
+  return findChzzkChannelIdDeep(item);
+}
+
+function findChzzkChannelIdDeep(value, depth = 0) {
+  if (depth > 8 || value == null) return '';
+
+  if (typeof value === 'string') {
+    const fromUrl = extractChzzkChannelIdFromText(value);
+    if (fromUrl) return fromUrl;
+
+    if (looksLikeChzzkChannelId(value)) return value.trim();
+
+    return '';
+  }
+
+  if (typeof value !== 'object') return '';
+
+  for (const [key, child] of Object.entries(value)) {
+    const keyLower = key.toLowerCase();
+
+    if (
+      typeof child === 'string' &&
+      (keyLower.includes('chzzk') ||
+        keyLower.includes('channel') ||
+        keyLower.includes('streamer'))
+    ) {
+      const fromText = extractChzzkChannelIdFromText(child);
+      if (fromText) return fromText;
+
+      if (looksLikeChzzkChannelId(child)) return child.trim();
+    }
+  }
+
+  for (const child of Object.values(value)) {
+    const found = findChzzkChannelIdDeep(child, depth + 1);
+    if (found) return found;
+  }
+
+  return '';
+}
+
+function extractChzzkChannelIdFromText(text) {
+  if (typeof text !== 'string') return '';
+
+  const match = text.match(/chzzk\.naver\.com\/(?:live\/)?([a-zA-Z0-9_-]{12,40})/);
+  if (match) return match[1];
+
+  return '';
+}
+
+function looksLikeChzzkChannelId(value) {
+  if (typeof value !== 'string') return false;
+
+  const trimmed = value.trim();
+
+  if (!/^[a-zA-Z0-9_-]{12,40}$/.test(trimmed)) return false;
+  if (/^\d+$/.test(trimmed)) return false;
+
+  return true;
 }
 
 function dedupeStreamersByChannelId(streamers) {
