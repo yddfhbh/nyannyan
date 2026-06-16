@@ -1028,23 +1028,38 @@ async function fetchVirtualStockItems() {
     const data = await fetchVirtualStockPage(page, liveNotifierConfig.stockPageSize);
     const rows = extractArrayFromVirtualStockResponse(data);
 
-    if (rows.length === 0) break;
+    if (rows.length === 0) {
+      console.log(`Virtual-stock page ${page}: rows=0, stop.`);
+      break;
+    }
+
+    let addedCount = 0;
 
     for (const row of rows) {
       const key =
-        getFirstString(row, ['id', 'stockId', 'symbol', 'code']) ||
+        getFirstString(row, ['id', 'stockId', 'stock_id', 'symbol', 'code']) ||
         getNestedString(row, ['streamer', 'id']) ||
         getNestedString(row, ['channel', 'id']) ||
-        getFirstString(row, ['chzzkChannelId', 'channelId']) ||
+        getFirstString(row, ['channelName', 'name']) ||
         JSON.stringify(row).slice(0, 120);
 
       if (seenKeys.has(key)) continue;
 
       seenKeys.add(key);
       allItems.push(row);
+      addedCount += 1;
     }
 
-    if (rows.length < liveNotifierConfig.stockPageSize) break;
+    console.log(
+      `Virtual-stock page ${page}: rows=${rows.length}, added=${addedCount}, total=${allItems.length}`,
+    );
+
+    // page 파라미터가 무시돼서 같은 50개만 계속 오는 경우 무한 반복 방지
+    if (addedCount === 0) {
+      console.log(`Virtual-stock page ${page}: no new rows, stop.`);
+      break;
+    }
+
     await sleep(200);
   }
 
