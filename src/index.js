@@ -37,6 +37,9 @@ const liveNotifierConfig = {
   stockScanPages: Math.max(1, Number(process.env.VSTOCK_STOCKS_SCAN_PAGES || 30)),
   notifyOnBoot: parseBoolean(process.env.VSTOCK_NOTIFY_ON_BOOT),
   poolRefreshMs: Math.max(60_000, Number(process.env.VSTOCK_POOL_REFRESH_MS || 10 * 60_000)),
+  chzzkResolveDelayMs: Math.max(100, Number(process.env.CHZZK_RESOLVE_DELAY_MS || 250)),
+  chzzkResolveMaxPerRefresh: Math.max(1, Number(process.env.CHZZK_RESOLVE_MAX_PER_REFRESH || 200)),
+  chzzkSearchRequireExact: parseBoolean(process.env.CHZZK_SEARCH_REQUIRE_EXACT),
 };
 
 let liveNotifierStarted = false;
@@ -47,6 +50,8 @@ let lastLivePoolRefreshAt = 0;
 let streamerPool = [];
 let shuffledStreamerQueue = [];
 const liveStateByChannelId = new Map();
+const chzzkChannelIdByNameCache = new Map();
+const chzzkResolveMissCache = new Set();
 
 const commands = [
   new SlashCommandBuilder()
@@ -937,28 +942,52 @@ async function refreshStreamerPoolIfNeeded({ force = false } = {}) {
   try {
     const items = await fetchVirtualStockItems();
     const parsed = [];
+    let resolvedBySearch = 0;
+    let directIdCount = 0;
+    let resolveAttemptCount = 0;
+    let resolveSkipCount = 0;
 
     for (const item of items) {
-      let streamer = normalizeVirtualStockStreamer(item);
+      const name = extractStreamerName(item);
+      if (!name) continue;
 
-      if (!streamer) {
-        const detail = await fetchVirtualStockDetailFromListItem(item).catch((error) => {
-          console.warn(`Failed to fetch stock detail: ${error.message}`);
-          return null;
-        });
+      let chzzkChannelId = extractChzzkChannelId(item);
 
-        if (detail) {
-          streamer = normalizeVirtualStockStreamer({
-            ...item,
-            detail,
-          });
-        }
-
-        await sleep(100);
+      if (chzzkChannelId) {
+        directIdCount += 1;
       }
 
-      if (!streamer) continue;
-      parsed.push(streamer);
+      if (!chzzkChannelId) {
+        if (chzzkChannelIdByNameCache.has(name)) {
+          chzzkChannelId = chzzkChannelIdByNameCache.get(name);
+        } else if (chzzkResolveMissCache.has(name)) {
+          resolveSkipCount += 1;
+        } else if (resolveAttemptCount < liveNotifierConfig.chzzkResolveMaxPerRefresh) {
+          resolveAttemptCount += 1;
+
+          const resolved = await resolveChzzkChannelIdByName(name).catch((error) => {
+            console.warn(`Failed to resolve CHZZK channel: ${name} - ${error.message}`);
+            return '';
+          });
+
+          if (resolved) {
+            chzzkChannelId = resolved;
+            chzzkChannelIdByNameCache.set(name, resolved);
+            resolvedBySearch += 1;
+          } else {
+            chzzkResolveMissCache.add(name);
+          }
+
+          await sleep(liveNotifierConfig.chzzkResolveDelayMs);
+        }
+      }
+
+      if (!chzzkChannelId) continue;
+
+      parsed.push({
+        name,
+        chzzkChannelId,
+      });
     }
 
     const deduped = dedupeStreamersByChannelId(parsed);
@@ -968,7 +997,18 @@ async function refreshStreamerPoolIfNeeded({ force = false } = {}) {
     lastLivePoolRefreshAt = now;
 
     console.log(
-      `Live streamer pool refreshed. raw=${items.length}, parsed=${parsed.length}, deduped=${streamerPool.length}`,
+      [
+        'Live streamer pool refreshed.',
+        `raw=${items.length}`,
+        `parsed=${parsed.length}`,
+        `deduped=${streamerPool.length}`,
+        `directId=${directIdCount}`,
+        `resolvedBySearch=${resolvedBySearch}`,
+        `resolveAttempts=${resolveAttemptCount}`,
+        `resolveSkipped=${resolveSkipCount}`,
+        `cache=${chzzkChannelIdByNameCache.size}`,
+        `miss=${chzzkResolveMissCache.size}`,
+      ].join(' '),
     );
 
     if (items.length > 0 && parsed.length === 0) {
@@ -1133,30 +1173,119 @@ function extractStockId(item) {
 function extractStreamerName(item) {
   return (
     getFirstString(item, [
+      'channelName',
       'name',
       'stockName',
       'displayName',
       'streamerName',
-      'channelName',
       'nickname',
       'title',
     ]) ||
+    getNestedString(item, ['stock', 'channelName']) ||
     getNestedString(item, ['stock', 'name']) ||
     getNestedString(item, ['stock', 'stockName']) ||
-    getNestedString(item, ['streamer', 'name']) ||
     getNestedString(item, ['streamer', 'channelName']) ||
+    getNestedString(item, ['streamer', 'name']) ||
     getNestedString(item, ['streamer', 'nickname']) ||
     getNestedString(item, ['channel', 'channelName']) ||
     getNestedString(item, ['creator', 'name']) ||
+    getNestedString(item, ['detail', 'channelName']) ||
     getNestedString(item, ['detail', 'name']) ||
     getNestedString(item, ['detail', 'stockName']) ||
     getNestedString(item, ['detail', 'streamerName']) ||
-    getNestedString(item, ['detail', 'channelName']) ||
-    getNestedString(item, ['detail', 'streamer', 'name']) ||
     getNestedString(item, ['detail', 'streamer', 'channelName']) ||
+    getNestedString(item, ['detail', 'streamer', 'name']) ||
     getNestedString(item, ['detail', 'channel', 'channelName']) ||
     ''
   );
+}
+
+async function resolveChzzkChannelIdByName(name) {
+  const keyword = String(name || '').trim();
+  if (!keyword) return '';
+
+  const url =
+    `https://api.chzzk.naver.com/service/v1/search/channels` +
+    `?keyword=${encodeURIComponent(keyword)}` +
+    `&offset=0` +
+    `&size=5` +
+    `&withFirstChannelContent=false`;
+
+  const data = await fetchJson(url);
+  const candidates = extractChzzkSearchChannelCandidates(data);
+
+  if (candidates.length === 0) return '';
+
+  const normalizedKeyword = normalizeSearchName(keyword);
+
+  const exact = candidates.find((candidate) => {
+    return normalizeSearchName(candidate.channelName) === normalizedKeyword;
+  });
+
+  if (exact) {
+    console.log(`Resolved CHZZK exact: ${name} -> ${exact.channelName} (${exact.channelId})`);
+    return exact.channelId;
+  }
+
+  if (liveNotifierConfig.chzzkSearchRequireExact) {
+    console.log(
+      `CHZZK resolve miss exact-only: ${name}, candidates=${candidates
+        .map((candidate) => candidate.channelName)
+        .join(' / ')}`,
+    );
+    return '';
+  }
+
+  const first = candidates[0];
+
+  console.log(
+    `Resolved CHZZK first: ${name} -> ${first.channelName} (${first.channelId})`,
+  );
+
+  return first.channelId;
+}
+
+function extractChzzkSearchChannelCandidates(data) {
+  const content = data?.content ?? data;
+  const rows =
+    content?.data ||
+    content?.channels ||
+    content?.results ||
+    data?.data ||
+    [];
+
+  if (!Array.isArray(rows)) return [];
+
+  const candidates = [];
+
+  for (const row of rows) {
+    const channelObject = row?.channel || row;
+
+    const channelId =
+      getFirstString(channelObject, ['channelId', 'chzzkChannelId']) ||
+      getNestedString(row, ['channel', 'channelId']) ||
+      findChzzkChannelIdDeep(row);
+
+    const channelName =
+      getFirstString(channelObject, ['channelName', 'name']) ||
+      getNestedString(row, ['channel', 'channelName']);
+
+    if (!channelId || !channelName) continue;
+
+    candidates.push({
+      channelId,
+      channelName,
+    });
+  }
+
+  return candidates;
+}
+
+function normalizeSearchName(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '');
 }
 
 function extractChzzkChannelId(item) {
